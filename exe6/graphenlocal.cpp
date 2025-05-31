@@ -9,109 +9,111 @@
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
 
-Eigen::MatrixXd hamiltonian(double t, unsigned L_A, unsigned L_B, double sigma)
-{
-    unsigned size = 2 * L_A * L_B;  // Taille de la matrice H (2 états par site)
-    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(size, size);  // Initialisation de la matrice H à zéro
+enum AtomType { A = 0, B = 1 }; //subspace A & B
 
-    double espA = -sigma / 2;
-    double espB = sigma / 2;
+struct Hopping {
+    AtomType from;
+    AtomType to;
+    std::array<int, 2> displacement; // déplacement dans le réseau (x, y)
+    std::complex<double> amplitude;
+};
 
-    for (int a = 0; a < size; a += 2) {
-        int ia = (a / 2) % L_A;  // Indice dans la direction A
-        int ib = (a / 2) / L_A;  // Indice dans la direction B
+inline int getIndex(int x, int y, AtomType type, int Lx, int Ly){
+    x = (x +Lx) % Lx;
+    y = (y + Ly) % Ly;
+    return 2 * (x + Lx * y) + static_cast<int>(type);
+}
 
-        int b = a + 1;  // L'état B associé à l'état A
 
-        // Calcul des indices voisins avec conditions périodiques
-        int xa_a = (a + 2) % size;  // Voisin à droite (en x)
-        int ya_a = (a + 2 * L_A) % size;  // Voisin en bas (en y)
+Eigen::MatrixXcd buildHamiltonian(int Lx, int Ly, double t, double delta) {
+    int size = 2 * Lx * Ly; //2 atoms/sites
+    Eigen::MatrixXcd H = Eigen::MatrixXcd::Zero(size, size);
 
-        int xa_b = (b + 2) % size;  // Voisin à droite (pour B)
-        int ya_b = (b + 2 * L_A) % size;  // Voisin en bas (pour B)
+    // Potentiels sur chaque sous-réseau
+    std::complex<double> E_A(delta / 2.0, 0);
+    std::complex<double> E_B(-delta / 2.0, 0);
 
-        // Remplissage des termes diagonaux (potentiels)
-        H(a, a) = espA;
-        H(b, b) = espB;
+    // definition hoppings 
+    std::vector<Hopping> hoppings = {
+        {A, A, {0, 0}, E_A},
+        {B, B, {0, 0}, E_B},
+        {A, B, {0, 0}, -t},
+        {A, B, {-1, 0}, -t},
+        {A, B, {0, -1}, -t}
+    };
 
-        // Interaction entre voisins
-        // Voisins à droite (A et B)
-        H(a, xa_a) = -t;
-        H(xa_a, a) = -t;
-        H(b, xa_b) = -t;
-        H(xa_b, b) = -t;
-
-        // Voisins en bas (A et B)
-        H(a, ya_a) = -t;
-        H(ya_a, a) = -t;
-        H(b, ya_b) = -t;
-        H(ya_b, b) = -t;
+    // On remplit la matrice Hamiltonien
+    #pragma omp parallel for schedule(dynamic)
+    for (int x = 0; x < Lx; ++x) {
+        for (int y = 0; y < Ly; ++y) {
+            for (const auto& hop : hoppings) {
+                int from_idx = getIndex(x, y, hop.from, Lx, Ly); //on récupère l'indice de Atome A
+                int to_x = x + hop.displacement[0];
+                int to_y = y + hop.displacement[1];
+                int to_idx = getIndex(to_x, to_y, hop.to, Lx, Ly); //indice atom B
+                // On remplit la matrice Hamiltonien en utilisant définition hopping
+                H(from_idx, to_idx) += hop.amplitude;
+                // Le Hamiltonien est hermitien : on met aussi la transposée conjuguée si hop.from != hop.to
+                if (from_idx != to_idx) {
+                    H(to_idx, from_idx) += std::conj(hop.amplitude);
+                }
+            }
+        }
     }
-
     return H;
 }
 
 
-Eigen::VectorXd LDOS(double energy, double gamma, double t,unsigned L_A, unsigned L_B, double sigma) 
-{
-    double N = 2 * L_A * L_B; // Taille de la matrice H (2 états par site)
-    Eigen::MatrixXd H = hamiltonian(t, L_A, L_B, sigma);
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(H); // diagonalisation de H
-    Eigen::VectorXd eigenvalues = es.eigenvalues();
-    Eigen::VectorXd dos = Eigen::VectorXd::Zero(N);
+Eigen::VectorXd LDOS(double energy, double gamma, const Eigen::VectorXd& eigenvalues, const Eigen::MatrixXcd& eigenvectors) {
+    int N = eigenvalues.size();
+    Eigen::VectorXd ldos = Eigen::VectorXd::Zero(N);
 
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        double diff = energy - eigenvalues(n);
+        double lorentz = gamma / (diff * diff + gamma * gamma);
+        const auto& eigvec_n = eigenvectors.col(n);  // accès direct à la colonne n
 
-    #pragma omp parallel
-    {
-        Eigen::VectorXd dos_private = Eigen::VectorXd::Zero(N);
+        for (int i = 0; i < N; ++i) {
+            double weight = std::norm(eigvec_n(i));  // |ψ_n(i)|²
 
-        #pragma omp for schedule(static)
-
-        for (int i = 0; i < N; i++)
-        {
-            for(int j = 0; j < N; j++)
-            {
-                double k_x = (2 * i * M_PI) / N;
-                double k_y = (2 * j * M_PI) / N; 
-                for (int y = 1; y <= N; y++) //to respect orthoganility, from 1 to N (size N)
-                {
-                    double phi_x = sqrt(2.0 / (N + 1)) * sin(k_x * y);
-                    double phi_y = sqrt(2.0 / (N+1)) * sin(k_y * y); 
-                    double phi = phi_x * phi_y;
-                    double energy_val = eigenvalues(i); 
-                    dos_private(y-1) += (gamma / (((energy - energy_val) * (energy - energy_val)) + gamma * gamma)) * phi * phi;
-                }
-            }
-
+            #pragma omp atomic
+            ldos(i) += weight * lorentz;
         }
-
     }
-    dos = (1 / (M_PI * N * N)) * dos;
-    return dos;
-    
+
+    ldos /= M_PI;
+    return ldos;
 }
+
+
 
 
 int main()
 {
-    unsigned L_A = 50; // Nombre de points dans la direction A
-    unsigned L_B = 25; // Nombre de points dans la direction B
-    double t = 1; // hopping parameter
+    unsigned L_A = 25;
+    unsigned L_B = 25;
+    double t = 1;
     double gamma = 0.1;
     double sigma = 0.2;
     int energy = 4;
-    unsigned N_point = L_A * L_B; // Nombre total de points
+    unsigned N_point = L_A * L_B;
 
-    // Vecteurs pour stocker les temps et les accélérations
+    Eigen::MatrixXcd H = buildHamiltonian(L_A, L_B, t, sigma);
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXcd> es(H);
+    Eigen::VectorXd eigenvalues = es.eigenvalues();
+    Eigen::MatrixXcd eigenvectors = es.eigenvectors();
+
     Eigen::VectorXi thread_counts(4);
     thread_counts << 1, 2, 4, 8;
     Eigen::VectorXd times(4);
     Eigen::VectorXd speedups(4);
 
-
     for (int idx = 0; idx < thread_counts.size(); ++idx) {
         int threads = thread_counts(idx);
         omp_set_num_threads(threads);
+
+        std::vector<std::stringstream> buffers(threads); // 🟩 buffers placés au bon endroit
 
         std::ofstream DosFile("LDosGraphen_" + std::to_string(threads) + ".txt");
         if (!DosFile) {
@@ -124,16 +126,23 @@ int main()
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        // Calcul de la densité d'états (DOS) pour différentes énergies
-        for (int i = 0; i <= 2 * energy * 10; ++i) 
+        #pragma omp parallel
         {
-            double e = -energy + 0.1 * i;
-            Eigen::VectorXd dos = LDOS(e, gamma, t, L_A, L_B, sigma);
-            for (int j = 0; j < dos.size(); ++j)
+            int tid = omp_get_thread_num();
+        
+            #pragma omp for schedule(dynamic)
+            for (int i = 0; i <= 2 * energy * 10; ++i) 
             {
-                DosFile << dos(j) << '\n';
+                double e = -energy + 0.1 * i;
+                Eigen::VectorXd ldos = LDOS(e, gamma, eigenvalues, eigenvectors);
+        
+                buffers[tid] << e << "\n";
+                for (int j = 0; j < ldos.size(); ++j) {
+                    buffers[tid] << ldos(j) << "\n";
+                }
             }
         }
+        
 
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> total = end - start;
@@ -141,15 +150,19 @@ int main()
 
         std::cout << "Threads: " << threads << ", Time: " << total.count() << "s\n";
 
+        // Écrire tous les buffers
+        for (int t = 0; t < threads; ++t) {
+            DosFile << buffers[t].str();
+        }
+
         DosFile.close();
     }
 
-    // Calcul des accélérations (speedups)
+    // Calcul des accélérations
     for (int i = 0; i < times.size(); ++i) {
         speedups(i) = times(0) / times(i);
     }
 
-    // Sauvegarde des résultats dans un fichier speedup
     std::ofstream SpeedupFile("speedup_periodic.txt");
     if (!SpeedupFile) {
         std::cerr << "Impossible d'ouvrir le fichier speedup" << std::endl;
@@ -163,4 +176,4 @@ int main()
     return 0;
 }
 
-
+        
